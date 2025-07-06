@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import asyncio
 import multiprocessing as mp
 import os
@@ -90,52 +91,38 @@ class DHT(mp.context.ForkProcess):
         """Serve DHT forever. This function will not return until DHT node is shut down"""
 
         loop = switch_to_uvloop()
-        pipe_semaphore = asyncio.Semaphore(value=0)
-        loop.add_reader(self._inner_pipe.fileno(), pipe_semaphore.release)
+        # Set SIG_IGN handler to SIGINT
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-        async def _run():
-            # Set SIG_IGN handler to SIGINT
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            if self._daemon_listen_maddr is not None:
+                replicated_p2p = loop.run_until_complete(P2P.replicate(self._daemon_listen_maddr))
+            else:
+                replicated_p2p = None
+            self._node = loop.run_until_complete(DHTNode.create(
+                initial_peers=self.initial_peers,
+                num_workers=self.num_workers,
+                record_validator=self._record_validator,
+                p2p=replicated_p2p,
+                **self.kwargs,
+            ))
+        except Exception as e:
+            # Loglevel is DEBUG since normally the exception is propagated to the caller
+            logger.debug(e, exc_info=True)
+            self._ready.set_exception(e)
+            return
+        self._ready.set_result(None)
 
+        while True:
             try:
-                if self._daemon_listen_maddr is not None:
-                    replicated_p2p = await P2P.replicate(self._daemon_listen_maddr)
-                else:
-                    replicated_p2p = None
+                method, args, kwargs = self._inner_pipe.recv()
+            except (OSError, ConnectionError, RuntimeError, EOFError) as e:
+                logger.exception(f"Exception was raised when reading: `{e}`")
+                continue
+            loop.run_until_complete(getattr(self, method)(*args, **kwargs))
+            if method == "_shutdown":
+                break
 
-                self._node = await DHTNode.create(
-                    initial_peers=self.initial_peers,
-                    num_workers=self.num_workers,
-                    record_validator=self._record_validator,
-                    p2p=replicated_p2p,
-                    **self.kwargs,
-                )
-            except Exception as e:
-                # Loglevel is DEBUG since normally the exception is propagated to the caller
-                logger.debug(e, exc_info=True)
-                self._ready.set_exception(e)
-                return
-            self._ready.set_result(None)
-
-            while True:
-                try:
-                    await asyncio.wait_for(pipe_semaphore.acquire(), timeout=self._node.protocol.wait_timeout)
-                except asyncio.TimeoutError:
-                    pass
-                if not self._inner_pipe.poll():
-                    continue
-                try:
-                    method, args, kwargs = self._inner_pipe.recv()
-                except (OSError, ConnectionError, RuntimeError) as e:
-                    logger.exception(e)
-                    await asyncio.sleep(self._node.protocol.wait_timeout)
-                    continue
-                task = asyncio.create_task(getattr(self, method)(*args, **kwargs))
-                if method == "_shutdown":
-                    await task
-                    break
-
-        loop.run_until_complete(_run())
         loop.close()
 
     def run_in_background(self, await_ready: bool = True, timeout: Optional[float] = None) -> None:
@@ -164,20 +151,21 @@ class DHT(mp.context.ForkProcess):
         await self._node.shutdown()
 
     def get(
-        self, key: DHTKey, latest: bool = False, return_future: bool = False, **kwargs
+        self, key: DHTKey, latest: bool = False, return_future: bool = False, timeout: float = 120.0, **kwargs
     ) -> Union[Optional[ValueWithExpiration[DHTValue]], MPFuture]:
         """
         Search for a key across DHT and return either first or latest entry (if found).
         :param key: same key as in node.store(...)
         :param latest: if True, finds the latest value, otherwise finds any non-expired value (which is much faster)
         :param return_future: if False (default), return when finished. Otherwise return MPFuture and run in background.
+        :param timeout: seconds before timing out waiting for MPFuture result.
         :param kwargs: parameters forwarded to DHTNode.get_many_by_id
         :returns: (value, expiration time); if value was not found, returns None
         """
         assert os.getpid() != self.pid, "calling *external* DHT interface from inside DHT will result in a deadlock"
         future = MPFuture()
         self._outer_pipe.send(("_get", [], dict(key=key, latest=latest, future=future, **kwargs)))
-        return future if return_future else future.result()
+        return future if return_future else future.result(timeout=timeout)
 
     async def _get(self, key: DHTKey, latest: bool, future: MPFuture, **kwargs):
         try:
@@ -196,6 +184,7 @@ class DHT(mp.context.ForkProcess):
         expiration_time: DHTExpiration,
         subkey: Optional[Subkey] = None,
         return_future: bool = False,
+        timeout: float = 120.0,
         **kwargs,
     ) -> Union[bool, MPFuture]:
         """
@@ -206,6 +195,7 @@ class DHT(mp.context.ForkProcess):
         :param expiration_time: absolute time when the entry should expire, based on hivemind.get_dht_time()
         :param subkey: if specified, add a value under that subkey instead of overwriting key (see DHTNode.store_many)
         :param return_future: if False (default), return when finished. Otherwise return MPFuture and run in background.
+        :param timeout: seconds before timing out waiting for MPFuture result.
         :returns: True if store succeeds, False if it fails (due to no response or newer value)
         """
         assert os.getpid() != self.pid, "calling *external* DHT interface from inside DHT will result in a deadlock"
@@ -217,7 +207,7 @@ class DHT(mp.context.ForkProcess):
                 dict(key=key, value=value, expiration_time=expiration_time, subkey=subkey, future=future, **kwargs),
             )
         )
-        return future if return_future else future.result()
+        return future if return_future else future.result(timeout=timeout)
 
     async def _store(
         self,
